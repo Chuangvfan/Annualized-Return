@@ -6,6 +6,8 @@ from tkcalendar import DateEntry
 import json
 import os
 import shutil
+import pandas_market_calendars as mcal
+import uuid  # 新增：用于给每个计划生成唯一ID
 
 # 设置外观
 ctk.set_appearance_mode("System")
@@ -18,11 +20,13 @@ class GroupedFundApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("基金年化记账本 (月份自动分组版)")
-        self.geometry("900x850")  # 稍微加宽
+        self.title("基金年化记账本 (定投策略升级版)")
+        self.geometry("950x850")
 
         # 数据变量
         self.records = []
+        self.drip_records = []  # 定投记录
+        self.drip_plans = []  # 定投计划列表
         self.initial_capital = 0.0
         self.start_date_obj = None
         self.is_initialized = False
@@ -83,6 +87,10 @@ class GroupedFundApp(ctk.CTk):
                                      command=self.delete_selected)
         self.btn_del.grid(row=1, column=5, padx=5)
 
+        self.btn_drip = ctk.CTkButton(self.frame_ops, text="定投管理", fg_color="#8E44AD", hover_color="#7D3C98",
+                                      command=self.open_drip_setup)
+        self.btn_drip.grid(row=1, column=6, padx=5)
+
         # --- 3. 列表展示 (带分组和滚动条) ---
         self.tree_frame = ctk.CTkFrame(self)
         self.tree_frame.grid(row=3, column=0, padx=20, pady=5, sticky="nsew")
@@ -92,16 +100,14 @@ class GroupedFundApp(ctk.CTk):
         style.configure("Treeview", rowheight=28, font=("Arial", 11))
         style.configure("Treeview.Heading", font=("微软雅黑", 11, "bold"))
 
-        # 注意：这里我们使用了 #0 列作为树状层级列
         columns = ("type", "amount")
         self.tree = ttk.Treeview(self.tree_frame, columns=columns, selectmode="browse")
 
-        # 配置列 (#0 是自带的树状列，我们用来显示日期和组名)
         self.tree.heading("#0", text="日期 / 月份分组")
         self.tree.heading("type", text="操作类型")
         self.tree.heading("amount", text="金额 (流向)")
 
-        self.tree.column("#0", width=250, anchor="w")  # 左对齐方便看树形结构
+        self.tree.column("#0", width=250, anchor="w")
         self.tree.column("type", width=150, anchor="center")
         self.tree.column("amount", width=150, anchor="center")
 
@@ -148,15 +154,16 @@ class GroupedFundApp(ctk.CTk):
         # 启动
         self.load_data_from_file(DATA_FILE)
 
+        # 检查并生成今天的定投记录
+        self.generate_daily_drip_records()
+
     # ================= 核心：月份分组渲染逻辑 =================
 
     def render_tree_view(self):
         """重新渲染整个列表，按月份分组"""
-        # 1. 清空当前列表
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        # 2. 收集所有数据（包括初始本金）
         all_items = []
         if self.is_initialized:
             all_items.append({
@@ -174,61 +181,115 @@ class GroupedFundApp(ctk.CTk):
                 "is_init": False
             })
 
-        # 3. 按日期排序
+        for d in self.drip_records:
+            all_items.append({
+                "date": d[0],
+                "type": "【定投】",
+                "amount": d[1],
+                "is_init": False
+            })
+
         all_items.sort(key=lambda x: x["date"])
 
-        # 4. 分组并插入
         current_month_key = None
-        parent_node = None
-        month_items = []  # 暂存当月数据用于计算合计
+        month_items = []
 
-        # 辅助函数：插入之前的月份组
         def insert_month_group(month_key, items):
             if not month_key: return
             month_sum = sum(item["amount"] for item in items)
             sum_text = f"月度净流: {month_sum:+.2f}"
-
-            # 插入父节点 (月份)
-            # 这里的 text 就是显示在第一列 (#0) 的内容
             p_id = self.tree.insert("", "end", text=f"📅 {month_key} ({sum_text})", open=True)
-
-            # 插入子节点 (具体记录)
             for item in items:
                 display_date = item["date"].strftime("%Y-%m-%d")
                 val_tuple = (item["type"], f"{item['amount']}")
-                # values 对应 columns 定义的列 (type, amount)
-                # text 对应 #0 列 (日期)
                 self.tree.insert(p_id, "end", text=display_date, values=val_tuple)
 
         for item in all_items:
             month_key = item["date"].strftime("%Y年%m月")
-
             if month_key != current_month_key:
-                # 遇到新月份，先把上一个月渲染出来
                 insert_month_group(current_month_key, month_items)
-                # 重置
                 current_month_key = month_key
                 month_items = []
-
             month_items.append(item)
 
-        # 渲染最后一个月
         insert_month_group(current_month_key, month_items)
 
     # ================= 数据存取 =================
+
+    def is_trading_day(self, check_date):
+        try:
+            cal = mcal.get_calendar('XSHG')
+            schedule = cal.schedule(start_date=check_date - timedelta(days=30),
+                                    end_date=check_date + timedelta(days=30))
+            trading_days = schedule.index.date
+            return check_date in trading_days
+        except Exception as e:
+            print(f"获取交易日历失败: {e}")
+            return True
+
+    def generate_daily_drip_records(self):
+        """生成今天的定投记录（基于活跃的计划）"""
+        today_str = self.today_bj.strftime("%Y-%m-%d")
+
+        # 1. 检查今天是否已扣款
+        for record in self.drip_records:
+            if record[0].strftime("%Y-%m-%d") == today_str:
+                return
+
+        # 2. 检查是否为交易日
+        if not self.is_trading_day(self.today_bj):
+            return
+
+        # 3. 遍历计划，只处理 ACTIVE 且 日期已开始的
+        new_records_generated = False
+        for plan in self.drip_plans:
+            # 兼容旧数据：如果没 active 字段，默认为 True，如果有 end_date 暂且不管，只看 active
+            is_active = plan.get('active', True)
+            start_date = plan['start_date_obj']
+
+            if is_active and self.today_bj >= start_date:
+                # 再次检查：确保该计划今天没单独生成过（防止多计划重叠时的逻辑漏洞）
+                already_generated = False
+                # 这里我们假设一个计划一天只投一次。如果需要更精细的追踪，需要记录 plan_id
+                # 但目前为了简单，我们检查金额和日期
+                for record in self.drip_records:
+                    if (record[0] == self.today_bj and
+                            abs(record[1] - (-plan['amount'])) < 0.001):
+                        already_generated = True
+                        break
+
+                if not already_generated:
+                    self.drip_records.append((self.today_bj, -plan['amount']))
+                    new_records_generated = True
+
+        if new_records_generated:
+            self.save_data()
+            self.render_tree_view()
 
     def save_data(self):
         data = {
             "initialized": self.is_initialized,
             "initial_capital": self.initial_capital,
             "start_date": self.start_date_obj.strftime("%Y-%m-%d") if self.start_date_obj else None,
-            "records": []
+            "records": [],
+            "drip_records": [],
+            "drip_plans": []
         }
         for r in self.records:
-            data["records"].append({
-                "date": r[0].strftime("%Y-%m-%d"),
-                "amount": r[1]
+            data["records"].append({"date": r[0].strftime("%Y-%m-%d"), "amount": r[1]})
+        for d in self.drip_records:
+            data["drip_records"].append({"date": d[0].strftime("%Y-%m-%d"), "amount": d[1]})
+
+        for p in self.drip_plans:
+            # 保存计划数据，移除 end_date，增加 active 和 id
+            data["drip_plans"].append({
+                "id": p.get("id", str(uuid.uuid4())),
+                "name": p.get("name", "未命名计划"),
+                "amount": p["amount"],
+                "start_date": p["start_date"],
+                "active": p.get("active", True)
             })
+
         try:
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
@@ -250,11 +311,9 @@ class GroupedFundApp(ctk.CTk):
                 self.is_initialized = True
                 self.initial_capital = data["initial_capital"]
                 self.start_date_obj = datetime.strptime(data["start_date"], "%Y-%m-%d").date()
-
                 self.entry_start_date.set_date(self.start_date_obj)
                 self.entry_init_money.delete(0, "end")
                 self.entry_init_money.insert(0, str(self.initial_capital))
-
                 self.entry_start_date.configure(state="disabled")
                 self.entry_init_money.configure(state="disabled")
                 self.btn_init.configure(state="disabled", text="已锁定")
@@ -262,10 +321,35 @@ class GroupedFundApp(ctk.CTk):
             self.records = []
             for r in data.get("records", []):
                 d_obj = datetime.strptime(r["date"], "%Y-%m-%d").date()
-                amount = r["amount"]
-                self.records.append((d_obj, amount))
+                self.records.append((d_obj, r["amount"]))
 
-            # 加载完数据后，调用分组渲染
+            self.drip_records = []
+            for d in data.get("drip_records", []):
+                d_obj = datetime.strptime(d["date"], "%Y-%m-%d").date()
+                self.drip_records.append((d_obj, d["amount"]))
+
+            self.drip_plans = []
+            for p in data.get("drip_plans", []):
+                start_date_obj = datetime.strptime(p["start_date"], "%Y-%m-%d").date()
+
+                # 兼容旧数据处理
+                active_status = p.get("active", True)
+
+                # 如果是旧数据（有end_date但没有active），我们假设只要还没过期就是True
+                if "end_date" in p and "active" not in p:
+                    end_obj = datetime.strptime(p["end_date"], "%Y-%m-%d").date()
+                    if end_obj < self.today_bj:
+                        active_status = False  # 已过期的旧计划默认关闭
+
+                self.drip_plans.append({
+                    "id": p.get("id", str(uuid.uuid4())),
+                    "name": p.get("name", "定投计划"),
+                    "amount": p["amount"],
+                    "start_date": p["start_date"],
+                    "start_date_obj": start_date_obj,
+                    "active": active_status
+                })
+
             self.render_tree_view()
 
         except Exception as e:
@@ -284,15 +368,137 @@ class GroupedFundApp(ctk.CTk):
             self.start_date_obj = d_obj
             self.initial_capital = m
             self.is_initialized = True
-
             self.entry_start_date.configure(state="disabled")
             self.entry_init_money.configure(state="disabled")
             self.btn_init.configure(state="disabled", text="已锁定")
-
             self.save_data()
-            self.render_tree_view()  # 刷新视图
+            self.render_tree_view()
         except ValueError:
             messagebox.showerror("错误", "金额必须是数字")
+
+    def open_drip_setup(self):
+        """打开定投管理面板（升级版）"""
+        if not self.is_initialized:
+            messagebox.showwarning("提示", "请先锁定初始本金！")
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("管理定投计划")
+        dialog.geometry("500x500")  # 加大窗口
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        # 居中
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (500 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (500 // 2)
+        dialog.geometry(f"+{x}+{y}")
+
+        # --- 新建计划区域 ---
+        new_frame = ctk.CTkFrame(dialog, fg_color=("gray90", "gray20"))
+        new_frame.pack(fill="x", padx=10, pady=10)
+
+        ctk.CTkLabel(new_frame, text="➕ 新建计划", font=("微软雅黑", 12, "bold")).pack(anchor="w", padx=10, pady=5)
+
+        grid_f = ctk.CTkFrame(new_frame, fg_color="transparent")
+        grid_f.pack(padx=10, pady=5)
+
+        ctk.CTkLabel(grid_f, text="名称:").grid(row=0, column=0, padx=5, sticky="e")
+        name_entry = ctk.CTkEntry(grid_f, width=100, placeholder_text="如: 沪深300")
+        name_entry.grid(row=0, column=1, padx=5)
+
+        ctk.CTkLabel(grid_f, text="日金额:").grid(row=0, column=2, padx=5, sticky="e")
+        amount_entry = ctk.CTkEntry(grid_f, width=80, placeholder_text="100")
+        amount_entry.grid(row=0, column=3, padx=5)
+
+        ctk.CTkLabel(grid_f, text="开始日:").grid(row=0, column=4, padx=5, sticky="e")
+        start_date_entry = DateEntry(grid_f, width=10, background='#3B8ED0',
+                                     foreground='white', borderwidth=2,
+                                     date_pattern='yyyy-mm-dd', font=("Arial", 10))
+        start_date_entry.grid(row=0, column=5, padx=5)
+        start_date_entry.set_date(self.today_bj)
+
+        def add_plan():
+            try:
+                amt = float(amount_entry.get())
+                if amt <= 0: raise ValueError
+                name = name_entry.get().strip()
+                if not name: name = "定投计划"
+
+                self.drip_plans.append({
+                    "id": str(uuid.uuid4()),
+                    "name": name,
+                    "amount": amt,
+                    "start_date": start_date_entry.get_date().strftime("%Y-%m-%d"),
+                    "start_date_obj": start_date_entry.get_date(),
+                    "active": True
+                })
+                self.save_data()
+                refresh_list()  # 刷新列表
+                # 清空输入
+                name_entry.delete(0, "end")
+                amount_entry.delete(0, "end")
+            except ValueError:
+                messagebox.showerror("错误", "请输入正确的金额")
+
+        ctk.CTkButton(new_frame, text="添加并启动", command=add_plan, fg_color="#27AE60").pack(pady=10)
+
+        # --- 现有计划列表 ---
+        ctk.CTkLabel(dialog, text="📋 现有计划 (点击开关控制启停)", font=("微软雅黑", 12, "bold")).pack(anchor="w",
+                                                                                                       padx=20,
+                                                                                                       pady=(10, 0))
+
+        list_scroll = ctk.CTkScrollableFrame(dialog, height=300)
+        list_scroll.pack(fill="both", expand=True, padx=10, pady=5)
+
+        def toggle_plan(plan, switch_var):
+            plan['active'] = bool(switch_var.get())
+            self.save_data()
+            # 更新状态标签颜色（可选）
+
+        def delete_plan_permanent(plan):
+            if messagebox.askyesno("删除", "确定彻底删除此计划吗？\n(历史已生成的扣款记录不会被删除)"):
+                if plan in self.drip_plans:
+                    self.drip_plans.remove(plan)
+                    self.save_data()
+                    refresh_list()
+
+        def refresh_list():
+            for widget in list_scroll.winfo_children():
+                widget.destroy()
+
+            if not self.drip_plans:
+                ctk.CTkLabel(list_scroll, text="暂无计划").pack(pady=20)
+                return
+
+            for plan in self.drip_plans:
+                p_frame = ctk.CTkFrame(list_scroll, fg_color=("white", "#333333"))
+                p_frame.pack(fill="x", pady=2, padx=2)
+
+                # 左侧信息
+                info_text = f"{plan['name']}\n每日 {plan['amount']}元 | {plan['start_date']} 开始"
+                ctk.CTkLabel(p_frame, text=info_text, anchor="w", justify="left").pack(side="left", padx=10, pady=5)
+
+                # 右侧删除按钮
+                ctk.CTkButton(p_frame, text="🗑️", width=40, fg_color="#C0392B",
+                              command=lambda p=plan: delete_plan_permanent(p)).pack(side="right", padx=5)
+
+                # 右侧开关
+                switch_var = ctk.IntVar(value=1 if plan.get('active', True) else 0)
+                sw = ctk.CTkSwitch(p_frame, text="运行中" if plan.get('active', True) else "已暂停",
+                                   variable=switch_var, onvalue=1, offvalue=0, width=80,
+                                   command=lambda p=plan, v=switch_var: toggle_plan_ui(p, v))
+                sw.pack(side="right", padx=10)
+
+                # 闭包辅助函数，用于更新开关文字
+                def toggle_plan_ui(p, v, s=sw):
+                    is_on = bool(v.get())
+                    p['active'] = is_on
+                    s.configure(text="运行中" if is_on else "已暂停")
+                    self.save_data()
+
+        refresh_list()
 
     def add_record(self, op_type):
         if not self.is_initialized:
@@ -303,28 +509,25 @@ class GroupedFundApp(ctk.CTk):
             m_str = self.entry_op_amount.get()
             if not m_str: return
             m = float(m_str)
+            if m <= 0: return
         except:
             return
 
-        real_val = -m if op_type == "buy" else m
+        if op_type == "buy":
+            real_val = -m
+            self.records.append((d_obj, real_val))
+        elif op_type == "sell":
+            real_val = m
+            self.records.append((d_obj, real_val))
 
-        self.records.append((d_obj, real_val))
         self.entry_op_amount.delete(0, "end")
-
         self.save_data()
-        self.render_tree_view()  # 刷新视图
+        self.render_tree_view()
 
     def delete_selected(self):
         selected_id = self.tree.selection()
         if not selected_id: return
-
-        # 获取选中项的详细信息
         item = self.tree.item(selected_id[0])
-
-        # 如果选中的是父节点（月份），不允许删除，提示用户
-        # 判断方法：父节点values一般是空的或者我们在values里没有存那么多数据，
-        # 最简单的方法是看它是否有子节点，或者直接看 values 的长度/内容
-        # 在我们的逻辑里，父节点的 text 是 "📅 2024年1月...", 子节点 text 是 "2024-01-01"
         item_text = item["text"]
 
         if "📅" in item_text:
@@ -332,9 +535,6 @@ class GroupedFundApp(ctk.CTk):
             return
 
         item_values = item["values"]
-        # values[0] 是 type, values[1] 是 amount
-        # text 是日期
-
         del_date_str = item_text
         if item_values[0] == "【初始本金】":
             messagebox.showwarning("提示", "初始本金不能删除")
@@ -342,14 +542,19 @@ class GroupedFundApp(ctk.CTk):
 
         try:
             del_amount = float(item_values[1])
-            # 在 records 列表里查找并删除
-            for i, r in enumerate(self.records):
-                if r[0].strftime("%Y-%m-%d") == del_date_str and abs(r[1] - del_amount) < 0.001:
-                    self.records.pop(i)
-                    break
+            if item_values[0] == "【定投】":
+                for i, d in enumerate(self.drip_records):
+                    if d[0].strftime("%Y-%m-%d") == del_date_str and abs(d[1] - del_amount) < 0.001:
+                        self.drip_records.pop(i)
+                        break
+            else:
+                for i, r in enumerate(self.records):
+                    if r[0].strftime("%Y-%m-%d") == del_date_str and abs(r[1] - del_amount) < 0.001:
+                        self.records.pop(i)
+                        break
 
             self.save_data()
-            self.render_tree_view()  # 重新分组渲染
+            self.render_tree_view()
         except:
             pass
 
@@ -366,6 +571,8 @@ class GroupedFundApp(ctk.CTk):
         all_transactions.append((self.start_date_obj, -self.initial_capital))
         for r in self.records:
             all_transactions.append((r[0], r[1]))
+        for d in self.drip_records:
+            all_transactions.append((d[0], d[1]))
         all_transactions.append((end_date_obj, end_val))
 
         all_transactions.sort(key=lambda x: x[0])
