@@ -15,6 +15,18 @@
 
 4.  **数据本地化**
     所有数据以 JSON 格式存储于本地，支持一键导出备份与恢复。
+    
+## 环境与部署建议
+
+1.  **依赖库安装**
+    本项目依赖以下第三方库，运行前请确保已安装：
+    ```bash
+    pip install customtkinter scipy tkcalendar pandas_market_calendars
+    ```
+    *(注：tkinter, json, os 等标准库通常随 Python 自动安装，无需手动下载)*
+
+2.  **程序打包**
+    建议使用 **PyInstaller** 将源码打包为独立可执行文件，方便日常使用：
 
 ## 免责声明
 
