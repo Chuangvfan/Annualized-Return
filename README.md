@@ -23,7 +23,6 @@
     ```bash
     pip install customtkinter scipy tkcalendar pandas_market_calendars
     ```
-    *(注：tkinter, json, os 等标准库通常随 Python 自动安装，无需手动下载)*
 
 2.  **程序打包**
     建议使用 **PyInstaller** 将源码打包为独立可执行文件，方便日常使用：
