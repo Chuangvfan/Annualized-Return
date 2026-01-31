@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import uuid
+import pandas as pd  # 引入pandas处理日期的加减（月度/周度）
 
 # 尝试导入金融日历库
 try:
@@ -28,7 +29,7 @@ class GroupedFundApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("基金年化记账本 (修复版 + 性能优化)")
+        self.title("基金年化记账本 (增强版：多周期定投+自动顺延)")
         self.geometry("1100x900")
 
         # 数据变量
@@ -40,7 +41,6 @@ class GroupedFundApp(ctk.CTk):
         self.is_initialized = False
 
         # --- 1. 初始化多市场日历 ---
-        # 优化：日历对象较大，初始化一次即可
         self.calendars = {}
         if HAS_MCAL:
             try:
@@ -276,9 +276,15 @@ class GroupedFundApp(ctk.CTk):
         self.lbl_total_principal.configure(text=f"累计投入: {total_invested:,.2f}")
         self.lbl_current_cash.configure(text=f"剩余现金: {current_cash:,.2f}")
 
-    # ================= 业务逻辑：自动定投 =================
+    # ================= 业务逻辑：增强版自动定投 =================
 
     def generate_daily_drip_records(self):
+        """
+        核心逻辑重写：
+        1. 支持 日/周/月 频率。
+        2. 计算名义日期，如果名义日期非交易日，则顺延至下一个交易日。
+        3. 顺延不影响下一次名义日期的计算（例如：周五顺延到下周一，下一次定投依然是下周五）。
+        """
         if not self.drip_plans: return
         active_plans = [p for p in self.drip_plans if p.get('active', True)]
         if not active_plans: return
@@ -286,18 +292,27 @@ class GroupedFundApp(ctk.CTk):
         earliest_start = min(p['start_date_obj'] for p in active_plans)
         if earliest_start > self.today_bj: return
 
-        # 批量获取各市场日历
+        # --- 批量获取日历 (缓存) ---
+        # 我们多取一点时间，防止顺延到未来
+        search_end_date = self.today_bj + timedelta(days=15)
+
         trading_days_map = {}
+        sorted_trading_days_list = {}  # 用于快速查找"下一个交易日"
+
         for market_code in ['CN', 'US']:
             trading_days_map[market_code] = set()
+            sorted_trading_days_list[market_code] = []
             if market_code in self.calendars:
                 try:
-                    # 获取一次即可，无需循环内获取
-                    schedule = self.calendars[market_code].schedule(start_date=earliest_start, end_date=self.today_bj)
-                    trading_days_map[market_code] = set(schedule.index.date)
+                    schedule = self.calendars[market_code].schedule(start_date=earliest_start, end_date=search_end_date)
+                    # 转换为 Python date 对象
+                    dates = [ts.date() for ts in schedule.index]
+                    trading_days_map[market_code] = set(dates)
+                    sorted_trading_days_list[market_code] = sorted(dates)
                 except Exception as e:
                     print(f"获取 {market_code} 日历失败: {e}")
 
+        # --- 现有记录哈希，防止重复 ---
         existing_hashes = set()
         for r in self.drip_records:
             existing_hashes.add((r[0], round(r[1], 2), r[2]))
@@ -306,39 +321,69 @@ class GroupedFundApp(ctk.CTk):
 
         for plan in active_plans:
             market = plan.get('market', 'CN')
+            frequency = plan.get('frequency', 'daily')  # daily, weekly, monthly
             ignored_dates = set(plan.get('ignored_dates', []))
 
-            current_date = plan['start_date_obj']
+            # 名义上的计划执行日期
+            nominal_date = plan['start_date_obj']
             target_val = -plan['amount']
             remark_text = f"计划:{plan['name']}"
 
-            while current_date <= self.today_bj:
-                date_str = current_date.strftime("%Y-%m-%d")
-                if date_str in ignored_dates:
-                    current_date += timedelta(days=1)
-                    continue
+            # 辅助函数：查找 target_date 或之后的第一个交易日
+            def find_execution_date(target_date, mkt):
+                # 降级模式：如果没有日历，就当天
+                if not HAS_MCAL or mkt not in sorted_trading_days_list:
+                    return target_date
 
-                is_trade = False
-                if HAS_MCAL and market in trading_days_map:
-                    if current_date in trading_days_map[market]:
-                        is_trade = True
+                days_list = sorted_trading_days_list[mkt]
+                for d in days_list:
+                    if d >= target_date:
+                        return d
+                return target_date  # 如果超出了日历范围（极少见），就返回当天
+
+            # 循环直到 名义日期 超过今天
+            # 注意：这里判断的是 nominal_date，因为如果是月定投，名义日期没到下个月就不该投
+            # 但是执行日期(execution_date)必须 <= today_bj 才能入账
+
+            while nominal_date <= self.today_bj:
+
+                # 1. 计算顺延后的实际交易日
+                execution_date = find_execution_date(nominal_date, market)
+
+                # 2. 如果顺延后的日期还没到今天，或者刚好是今天，则尝试记录
+                #    如果顺延到了明天，那今天就还不能记
+                if execution_date <= self.today_bj:
+
+                    # 检查是否被用户忽略 (检查的是名义日期，因为用户通常是想忽略这一期)
+                    # 或者是 实际执行日期
+                    nominal_str = nominal_date.strftime("%Y-%m-%d")
+                    exec_str = execution_date.strftime("%Y-%m-%d")
+
+                    if nominal_str not in ignored_dates and exec_str not in ignored_dates:
+                        record_key = (execution_date, round(target_val, 2), remark_text)
+
+                        if record_key not in existing_hashes:
+                            self.drip_records.append((execution_date, target_val, remark_text))
+                            existing_hashes.add(record_key)
+                            new_cnt += 1
+
+                # 3. 计算下一个【名义】日期 (保持节奏，不受顺延影响)
+                if frequency == 'daily':
+                    nominal_date += timedelta(days=1)
+                elif frequency == 'weekly':
+                    nominal_date += timedelta(weeks=1)
+                elif frequency == 'monthly':
+                    # 使用 pandas DateOffset 处理月度增加 (自动处理大小月)
+                    next_ts = pd.Timestamp(nominal_date) + pd.DateOffset(months=1)
+                    nominal_date = next_ts.date()
                 else:
-                    is_trade = True  # 降级模式
-
-                if is_trade:
-                    record_key = (current_date, round(target_val, 2), remark_text)
-                    if record_key not in existing_hashes:
-                        self.drip_records.append((current_date, target_val, remark_text))
-                        existing_hashes.add(record_key)
-                        new_cnt += 1
-
-                current_date += timedelta(days=1)
+                    nominal_date += timedelta(days=1)  # 默认日
 
         if new_cnt > 0:
             self.drip_records.sort(key=lambda x: x[0])
             self.save_data()
             self.render_tree_view()
-            messagebox.showinfo("定投助手", f"已自动补录 {new_cnt} 条记录")
+            messagebox.showinfo("定投助手", f"已自动补录 {new_cnt} 条记录 (包含顺延处理)")
 
     def save_data(self):
         data = {
@@ -355,13 +400,13 @@ class GroupedFundApp(ctk.CTk):
                 "id": p.get("id", str(uuid.uuid4())),
                 "name": p.get("name"),
                 "market": p.get("market", "CN"),
+                "frequency": p.get("frequency", "daily"),  # 保存频率
                 "amount": p["amount"],
                 "start_date": p["start_date"],
                 "active": p.get("active", True),
                 "ignored_dates": p.get("ignored_dates", [])
             })
 
-        # 优化：添加 ensure_ascii=False 减小文件体积并可读
         try:
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
@@ -401,6 +446,7 @@ class GroupedFundApp(ctk.CTk):
                     "id": p.get("id", str(uuid.uuid4())),
                     "name": p.get("name", "定投计划"),
                     "market": p.get("market", "CN"),
+                    "frequency": p.get("frequency", "daily"),  # 读取频率，默认daily
                     "amount": p["amount"],
                     "start_date": p["start_date"],
                     "start_date_obj": datetime.strptime(p["start_date"], "%Y-%m-%d").date(),
@@ -437,12 +483,12 @@ class GroupedFundApp(ctk.CTk):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("定投计划管理")
-        dialog.geometry("550x600")
+        dialog.geometry("600x650")  # 稍微加大一点
         dialog.grab_set()
 
         dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() - 550) // 2
-        y = (dialog.winfo_screenheight() - 600) // 2
+        x = (dialog.winfo_screenwidth() - 600) // 2
+        y = (dialog.winfo_screenheight() - 650) // 2
         dialog.geometry(f"+{x}+{y}")
 
         new_frame = ctk.CTkFrame(dialog, fg_color=("gray90", "#3a3a3a"))
@@ -450,11 +496,12 @@ class GroupedFundApp(ctk.CTk):
 
         ctk.CTkLabel(new_frame, text="➕ 新建计划", font=("微软雅黑", 12, "bold")).pack(anchor="w", padx=10, pady=5)
 
+        # 第一行输入
         grid_f = ctk.CTkFrame(new_frame, fg_color="transparent")
         grid_f.pack(padx=10, pady=5)
 
         ctk.CTkLabel(grid_f, text="名称:").grid(row=0, column=0, padx=5, sticky="e")
-        name_entry = ctk.CTkEntry(grid_f, width=100, placeholder_text="如: 纳指100")
+        name_entry = ctk.CTkEntry(grid_f, width=100, placeholder_text="如: 标普500")
         name_entry.grid(row=0, column=1, padx=5)
 
         ctk.CTkLabel(grid_f, text="市场:").grid(row=0, column=2, padx=5, sticky="e")
@@ -462,14 +509,29 @@ class GroupedFundApp(ctk.CTk):
         market_combo = ctk.CTkComboBox(grid_f, width=80, values=["CN", "US"], variable=market_var)
         market_combo.grid(row=0, column=3, padx=5)
 
-        ctk.CTkLabel(grid_f, text="日金额:").grid(row=1, column=0, padx=5, sticky="e", pady=5)
-        amount_entry = ctk.CTkEntry(grid_f, width=100, placeholder_text="100")
-        amount_entry.grid(row=1, column=1, padx=5, pady=5)
+        # 第二行输入
+        ctk.CTkLabel(grid_f, text="频率:").grid(row=1, column=0, padx=5, sticky="e", pady=5)
+        freq_var = ctk.StringVar(value="daily")
+        # 映射显示名到内部值
+        freq_display_map = {"每日": "daily", "每周": "weekly", "每月": "monthly"}
+        freq_value_map = {v: k for k, v in freq_display_map.items()}
 
-        ctk.CTkLabel(grid_f, text="开始日:").grid(row=1, column=2, padx=5, sticky="e", pady=5)
-        start_date_entry = DateEntry(grid_f, width=10, date_pattern='yyyy-mm-dd')
-        start_date_entry.grid(row=1, column=3, padx=5, pady=5)
+        freq_combo = ctk.CTkComboBox(grid_f, width=100, values=["每日", "每周", "每月"],
+                                     command=lambda x: freq_var.set(freq_display_map[x]))
+        freq_combo.set("每日")  # 默认显示
+        freq_combo.grid(row=1, column=1, padx=5, pady=5)
+
+        ctk.CTkLabel(grid_f, text="金额:").grid(row=1, column=2, padx=5, sticky="e", pady=5)
+        amount_entry = ctk.CTkEntry(grid_f, width=80, placeholder_text="100")
+        amount_entry.grid(row=1, column=3, padx=5, pady=5)
+
+        # 第三行输入
+        ctk.CTkLabel(grid_f, text="首次扣款日:").grid(row=2, column=0, padx=5, sticky="e", pady=5)
+        start_date_entry = DateEntry(grid_f, width=12, date_pattern='yyyy-mm-dd')
+        start_date_entry.grid(row=2, column=1, columnspan=2, sticky="w", padx=5, pady=5)
         start_date_entry.set_date(self.today_bj)
+
+        ctk.CTkLabel(grid_f, text="(周/月定投以此日为基准)").grid(row=2, column=3, padx=5, sticky="w")
 
         def add_plan():
             try:
@@ -477,11 +539,13 @@ class GroupedFundApp(ctk.CTk):
                 if amt <= 0: raise ValueError
                 name = name_entry.get().strip() or "未命名"
                 market = market_var.get()
+                freq = freq_var.get()  # daily, weekly, monthly
 
                 self.drip_plans.append({
                     "id": str(uuid.uuid4()),
                     "name": name,
                     "market": market,
+                    "frequency": freq,
                     "amount": amt,
                     "start_date": start_date_entry.get_date().strftime("%Y-%m-%d"),
                     "start_date_obj": start_date_entry.get_date(),
@@ -491,6 +555,8 @@ class GroupedFundApp(ctk.CTk):
                 self.save_data()
                 self.generate_daily_drip_records()
                 refresh_list()
+
+                # 清空部分
                 name_entry.delete(0, "end")
                 amount_entry.delete(0, "end")
             except ValueError:
@@ -499,7 +565,7 @@ class GroupedFundApp(ctk.CTk):
         ctk.CTkButton(new_frame, text="添加计划并运行", command=add_plan, fg_color="#27AE60").pack(pady=10)
 
         ctk.CTkLabel(dialog, text="📋 计划列表", font=("微软雅黑", 12, "bold")).pack(anchor="w", padx=20, pady=(10, 0))
-        list_scroll = ctk.CTkScrollableFrame(dialog, height=300)
+        list_scroll = ctk.CTkScrollableFrame(dialog, height=350)
         list_scroll.pack(fill="both", expand=True, padx=10, pady=5)
 
         def toggle_plan(plan, var):
@@ -524,10 +590,18 @@ class GroupedFundApp(ctk.CTk):
                 p_frame.pack(fill="x", pady=2, padx=2)
 
                 m_flag = "🇺🇸美股" if plan.get('market') == "US" else "🇨🇳A股"
-                info = f"[{m_flag}] {plan['name']}\n每日 {plan['amount']}元 | {plan['start_date']} 起"
-                ctk.CTkLabel(p_frame, text=info, anchor="w", justify="left").pack(side="left", padx=10, pady=5)
+                f_map = {"daily": "每日", "weekly": "每周", "monthly": "每月"}
+                freq_str = f_map.get(plan.get('frequency', 'daily'), "每日")
 
-                ctk.CTkButton(p_frame, text="🗑️", width=40, fg_color="#C0392B",
+                info = f"[{m_flag}] {plan['name']} | {freq_str} {plan['amount']}元\n起始日: {plan['start_date']}"
+                ctk.CTkLabel(p_frame, text=info, anchor="w", justify="left", font=("Arial", 12)).pack(side="left",
+                                                                                                      padx=10, pady=5)
+
+                # 修改为文字按钮，透明背景
+                ctk.CTkButton(p_frame, text="删除", width=50,
+                              fg_color="transparent", border_width=1, border_color="gray",
+                              text_color=("gray10", "gray90"),
+                              hover_color=("gray80", "gray30"),
                               command=lambda p=plan: delete_plan(p)).pack(side="right", padx=5)
 
                 sv = ctk.IntVar(value=1 if plan.get('active', True) else 0)
@@ -574,8 +648,6 @@ class GroupedFundApp(ctk.CTk):
             if values[0] == "【定投】":
                 target_idx = -1
                 for i, r in enumerate(self.drip_records):
-                    # 【核心修复】这里是 r[2] 而不是 r.get(2)
-                    # 因为 self.drip_records 存的是 tuple，没有 get 方法
                     r_remark = r[2] if len(r) > 2 else ""
 
                     if (r[0].strftime("%Y-%m-%d") == item_date_str and
@@ -593,6 +665,9 @@ class GroupedFundApp(ctk.CTk):
                         for p in self.drip_plans:
                             if p['name'] == plan_name:
                                 if 'ignored_dates' not in p: p['ignored_dates'] = []
+                                # 这里保存的是界面上显示的日期（可能是顺延后的实际日期）
+                                # 为了稳健，我们应该同时忽略名义日期吗？
+                                # 简化策略：只忽略这一天。如果因为顺延导致第二天又补录，用户再删一次即可。
                                 if item_date_str not in p['ignored_dates']:
                                     p['ignored_dates'].append(item_date_str)
                                 break
@@ -607,7 +682,6 @@ class GroupedFundApp(ctk.CTk):
             self.save_data()
             self.render_tree_view()
         except Exception as e:
-            # 增加错误弹窗，方便调试
             messagebox.showerror("系统错误", f"删除失败: {str(e)}")
             print(f"删除异常: {e}")
 
@@ -632,15 +706,12 @@ class GroupedFundApp(ctk.CTk):
             years = [(d - dates[0]).days / 365.0 for d in dates]
 
             def xnpv(rate):
-                # 防止除以零或溢出
                 if rate <= -1.0: return float('inf')
                 return sum([a / ((1 + rate) ** y) for a, y in zip(amounts, years)])
 
-            # 【性能与稳定性优化】优先使用 Brent 方法，它比 Newton 法更稳健
             try:
                 res = optimize.brentq(xnpv, -0.999, 100)
             except:
-                # 如果 Brent 失败，尝试 Newton 作为备选
                 try:
                     res = optimize.newton(xnpv, 0.1, maxiter=50)
                 except:
