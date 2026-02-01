@@ -24,8 +24,7 @@
     pip install customtkinter scipy tkcalendar pandas_market_calendars
     ```
 
-2.  **程序打包**
-    建议使用 **PyInstaller** 将源码打包为独立可执行文件，方便日常使用：
+
 
 ## 免责声明
 
